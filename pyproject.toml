@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "RTHistory"
+authors = [
+    { name = "Justin Hink" }
+]
+description = "A command-line tool for collecting patient radiotherapy treatment data for transfer to external clinics upon request."
+requires-python = ">=3.10"
+license = { text = "proprietary" }
+classifiers = ["Programming Language :: Python :: 3.10"]
+dynamic = ["version", "readme", "dependencies"]
+
+[project.scripts]
+RTHistory = "RTHistory.__main__:start"
+
+[tool.setuptools.dynamic]
+version = { attr = "RTHistory._version.__version__" }
+readme = { file = ["README.md"] }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["RTHistory*"]
+
+# Ensure the config.json file is marked as part of the package data
+[tool.setuptools]
+include-package-data = true
+
+[project.optional-dependencies]
+doc = [
+    "sphinx~=7.2.6",
+    "sphinx-autobuild",
+    "myst-parser",
+    "sphinx-rtd-theme",
+    "sphinx-autoapi",
+    "rst-to-myst[sphinx]",
+]
