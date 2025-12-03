@@ -1,27 +1,26 @@
+# task_manager_sqlalchemy.py
 import sys
 import os
-import logging
 import json
 from pathlib import Path
 from queue import Queue
 from collections import namedtuple
-from .FileManager import FileManager
 from datetime import datetime
 
+import pydicom
+from .FileManager import FileManager
 from .QueryRetrieveSCU_rosamllib import MySCU
 from .StoreSCPRosamllib import MyStoreSCP
 from ._globals import (
-    LOGS_DIRECTORY,
-    PARENT_DIRECTORY,
-    LOG_FORMATTER,
     TEMP_DIRECTORY,
     MODALITY_BY_CLASS_UID,
 )
 
+from .logger_setup import TaskManager_task_logger  # SQLAlchemy logger
 
-# self.scu
 class TaskManager:
-    task_logger = None
+    # Assign the SQLAlchemy logger at class level
+    task_logger = TaskManager_task_logger
 
     def __init__(
         self,
@@ -31,23 +30,6 @@ class TaskManager:
         mrn: str = None,
         log_level_cli: str = None,
     ) -> None:
-        """_summary_
-
-        Parameters
-        ----------
-        scu : QueryRetrieveSCU
-            _description_
-        scp : StoreSCP
-            _description_
-        dates : List[str], optional
-            _description_, by default None
-        continue_ : str, optional
-            _description_, by default None
-        mrn : str, optional
-            _description_, by default None
-        log_level_cli : str, optional
-            _description_, by default None
-        """
         self.scu = scu
         self.scp = scp
         self.continue_ = continue_
@@ -67,44 +49,11 @@ class TaskManager:
                 "Attempt_No",
             ],
         )
+        self.list_file = Path(TEMP_DIRECTORY / "list_of_file_paths.txt")
+        
+        # Optional: if you want per-MRN database separation, you could wrap here
+        # self.task_logger.set_mrn(self.mrn)
 
-    def setup_logger(self) -> None:
-        """
-        Set up the logger for the TaskManager.
-
-        This method sets up the logger for the TaskManager by creating a new logger
-        instance, setting its level to DEBUG, and adding file and console handlers
-        with appropriate formatters and log file paths.
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        None
-        """
-
-        if TaskManager.task_logger:
-            TaskManager.task_logger.handlers.clear()
-        TaskManager.task_logger = logging.getLogger(__name__)
-        TaskManager.task_logger.setLevel(logging.DEBUG)
-
-        logger_path = LOGS_DIRECTORY.joinpath("mrn")
-        logger_path.mkdir(parents=True, exist_ok=True)
-        self.file_handler = logging.FileHandler(
-            logger_path.joinpath(
-                f"task_manager_mrn_{datetime.now().strftime('%Y%m%d')}.log"
-            )
-        )
-        self.file_handler.setFormatter(LOG_FORMATTER)
-        TaskManager.task_logger.addHandler(self.file_handler)
-
-        if self.log_level_cli:
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(LOG_FORMATTER)
-            console_handler.setLevel(self.log_level_cli)
-            TaskManager.task_logger.addHandler(console_handler)
 
     def run(self) -> None:
         """
@@ -131,32 +80,8 @@ class TaskManager:
 
     def run_from_mrn(self):
         """_summary_"""
-        logger_path = LOGS_DIRECTORY.joinpath("mrn")
-        logger_path.mkdir(parents=True, exist_ok=True)
-        scu_logger_file_path = logger_path.joinpath(
-                f"dcmqr_scu_mrn_{datetime.now().strftime('%Y%m%d')}.log"
-            )
-        scp_logger_file_path = logger_path.joinpath(
-                f"scp_mrn_{datetime.now().strftime('%Y%m%d')}.log"
-            )
-        self.scu.configure_logging(
-            log_to_console = False,
-            log_to_file = True,
-            log_file_path = scu_logger_file_path,
-            log_level = logging.DEBUG,
-            formatter = LOG_FORMATTER,
-        )
-        self.scp.configure_logging(
-            log_to_console = False,
-            log_to_file = True,
-            log_file_path = scp_logger_file_path,
-            log_level = logging.DEBUG,
-            formatter = LOG_FORMATTER,
-        )
-        self.setup_logger()
         self.scp.start()
         results = self.scu.find_treatment_records(mrn=self.mrn)
-        # print("Up To find_treatment_records works")
         for result in results:
             self.task_queue.put(
                 self.Item(
@@ -241,7 +166,7 @@ class TaskManager:
                 "IMAGE",
             )
             try:
-                if not status:
+                if not status.status:
                     TaskManager.task_logger.info(
                         f"Successfully moved {item.Modality} with "
                         + f"PatientID={item.PatientID}, "
@@ -249,7 +174,7 @@ class TaskManager:
                     )
                     # C-Move successful, get Referenced RTSTRUCT info
                     try:
-                        ds = MyStoreSCP.received_dicom[0]
+                        ds = self.scp.received_dicom[0]
                     except IndexError as e:
                         TaskManager.task_logger.error(
                             f"Did not receive {item.Modality} for "
@@ -268,10 +193,9 @@ class TaskManager:
                                 item.Attempt_No + 1,
                             )
                         )
-                        self.scu.check_status()
-                        MyStoreSCP.received_dicom = []
+                        self.scp.received_dicom = []
                         return
-                    MyStoreSCP.received_dicom = []
+                    self.scp.received_dicom = []
                     # Enque Referenced RTSTRUCT to Queue
                     try:
                         rt_struct_item = self.Item(
@@ -408,13 +332,13 @@ class TaskManager:
                 "IMAGE",
             )
             try:
-                if not status:                    
+                if not status.status:                    
                     TaskManager.task_logger.info(
                         f"Successfully moved {item.Modality} with "
                         + f"SOPInstanceUID={item.SOPInstanceUID} to SCP."
                     )
                     try:
-                        ds = MyStoreSCP.received_dicom[0]
+                        ds = self.scp.received_dicom[0]
                     except IndexError as e:
                         TaskManager.task_logger.error(
                             f"Did not receive {item.Modality} for "
@@ -433,10 +357,9 @@ class TaskManager:
                                 item.Attempt_No + 1,
                             )
                         )
-                        self.scu.check_status()
-                        MyStoreSCP.received_dicom = []
+                        self.scp.received_dicom = []
                         return
-                    MyStoreSCP.received_dicom = []
+                    self.scp.received_dicom = []
                     ROIContourSequence_Index = 0
                     try:
                         while (
@@ -556,10 +479,10 @@ class TaskManager:
                 item.SeriesInstanceUID,
                 "SERIES",
             )
-            MyStoreSCP.received_dicom = []
+            self.scp.received_dicom = []
 
             try:
-                if status:
+                if status.status:
                     TaskManager.task_logger.error(
                         f"Failed to move {item.Modality} with "
                         + f"SeriesInstanceUID={item.SeriesInstanceUID} to temp_file."
@@ -624,7 +547,7 @@ class TaskManager:
             )
 
             try:
-                if status:
+                if status.status:
                     TaskManager.task_logger.error(
                         f"Failed to move {item.Modality} with "
                         + f"SOPInstanceUID={item.SOPInstanceUID} to temp_file."
@@ -650,8 +573,7 @@ class TaskManager:
                     f"Error moving {item.Modality} to temp_file. " + f"{e}"
                 )
             try:
-                ds = MyStoreSCP.received_dicom[0]
-                
+                ds = self.scp.received_dicom[0]
             except IndexError as e:
                 TaskManager.task_logger.error(
                     f"Did not receive {item.Modality} for "
@@ -670,10 +592,10 @@ class TaskManager:
                         item.Attempt_No + 1,
                     )
                 )
-                MyStoreSCP.received_dicom = []
+                self.scp.received_dicom = []
 
                 return
-            MyStoreSCP.received_dicom = []
+            self.scp.received_dicom = []
 
         else:
             TaskManager.task_logger.info(
@@ -773,10 +695,10 @@ class TaskManager:
                     item.SeriesInstanceUID,
                     "SERIES",
                 )
-                MyStoreSCP.received_dicom = []
+                self.scp.received_dicom = []
 
                 try:
-                    if status:
+                    if status.status:
                         msg = f"Failed to move {item.Modality} to SCP. Status={status[-1][-1]}"
                         TaskManager.task_logger.error(msg, extra=image_info)
                         self.task_queue.put(

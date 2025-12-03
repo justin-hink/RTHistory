@@ -3,18 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-def get_config_path():
-    """
-    Returns a writable, persistent path for config.json.
-    When frozen by PyInstaller, puts it next to the .exe instead of inside the temp folder.
-    """
-    if getattr(sys, 'frozen', False):
-        # Running inside PyInstaller
-        base_path = Path(sys.executable).parent
-    else:
-        # Running as normal script
-        base_path = Path(__file__).parent
-    return base_path / "config.json"
+
 
 
 def create_default_config(config_path: Path):
@@ -53,8 +42,14 @@ def load_config():
     Loads config.json, prompting the user to create it if it doesn't exist.
     Returns the config dictionary.
     """
-    config_path = get_config_path()
 
+    if getattr(sys, 'frozen', False):
+        # Running inside PyInstaller
+        PARENT_DIRECTORY = Path(sys.executable).parent
+    else:
+        # Running as normal script
+        PARENT_DIRECTORY = Path(__file__).parent
+    config_path = PARENT_DIRECTORY / "config.json"
     if not config_path.exists():
         print(f"No config found. Creating new one at {config_path}...")
         return create_default_config(config_path)

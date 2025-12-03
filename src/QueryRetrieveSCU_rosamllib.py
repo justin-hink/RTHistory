@@ -9,17 +9,18 @@ from pydicom.sequence import Sequence
 from datetime import datetime  # , timedelta
 from pydicom.dataset import Dataset
 from rosamllib.networking import QueryRetrieveSCU
+from .config import load_config
 from ._globals import (
-    LOGS_DIRECTORY,
-    LOG_FORMATTER,
     PATIENT_OBJECT_KEYS,
     CLASS_UID_BY_MODALITY,
     MODALITY_BY_CLASS_UID,
-    SCP_AETITLE,
-    REMOTE_AET_DICT,
 )
+from .logger_setup import SCU_task_logger
 
 class MySCU(QueryRetrieveSCU):
+    def __init__(self, *args, logger=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logger = logger or SCU_task_logger
     # SCU QUERY TO FIND ALL RTRECORDS FOR A DAY
     # THIS LETS US SEND RTPLANS TO QUEUE
     # """QUERY for RTRECORDS by DAY"""
@@ -64,7 +65,9 @@ class MySCU(QueryRetrieveSCU):
         study_ds.ReferencedSOPInstanceUID = ""
         result["patients"] = []
         # Perform a Study Root Query/Retrieve operation with specified query dataset
-        responses = self.c_find(ae_name="VMSDBD2", query=study_ds)
+        config = load_config()
+
+        responses = self.c_find(ae_name=config["CLINICAL_SERVER"]["AETITLE"], query=study_ds)
         counter = 1
         for response in responses:
             if response is not None:
@@ -183,8 +186,10 @@ class MySCU(QueryRetrieveSCU):
         result = {}
 
         result["patients"] = []
+        config = load_config()
+
         # Perform a Study Root Query/Retrieve operation with specified query dataset
-        responses = self.c_find(ae_name="VMSDBD2", query=study_ds)
+        responses = self.c_find(ae_name=config["CLINICAL_SERVER"]["AETITLE"], query=study_ds)
         counter = 1
         for response in responses:
             if response is not None:
@@ -283,4 +288,6 @@ class MySCU(QueryRetrieveSCU):
                 temp_ds.SeriesInstanceUID = str(instance_uid)
             else:
                 temp_ds.SOPInstanceUID = str(instance_uid)
-            self.c_move(ae_name=REMOTE_AET_DICT["CLINICAL"]["AETITLE"], query=temp_ds, destination_ae=SCP_AETITLE)
+            config = load_config()
+
+            return self.c_move(ae_name=config["CLINICAL_SERVER"]["AETITLE"], query=temp_ds, destination_ae=config["SCP_SERVER"]["AETITLE"])

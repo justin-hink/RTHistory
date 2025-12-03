@@ -1,8 +1,6 @@
 import os
-import pydicom
 import pandas as pd
 import sys
-import logging
 from tabulate import tabulate
 from reportlab.lib.units import inch
 from reportlab.lib.pagesizes import letter
@@ -32,7 +30,7 @@ import matplotlib.pyplot as plt
 
 import zipfile
 import shutil
-
+from .logger_setup import pdf_logger
 
 class PDF_Parser:
     """ """
@@ -52,30 +50,14 @@ class PDF_Parser:
         self.table_title_list = []
         self.log_level_cli = None
         self.OAR_Flag = False
-        # self.csv_path = os.path.join(TEMP_DIRECTORY, f"{self.mrn}.csv")
-
         self.pdf_filename = os.path.join(
             TEMP_DIRECTORY, os.path.join(self.mrn, "Radiotherapy_Treatment_History.pdf")
         )
         self.ct_list = []
 
 
-    # def add_footer(self, canvas_obj, doc_obj):
-    #     """Draw footer on every page except the first."""
-    #     if doc_obj.page > 1:  # skip the first page
-    #         footer_text = "* = OrganAtRiskMaximumDose used instead of TargetPrescriptionDose"
-    #         canvas_obj.setFont("Helvetica", 8)
-    #         # draw centered at bottom
-    #         canvas_obj.drawCentredString(
-    #             4.25 * inch, 0.5 * inch, footer_text
-    #         )
-
-
-
-
-
     @staticmethod
-    def resamp(image: sitk.Image, new_spacing=(1.0, 1.0, 1.0), interpolator=sitk.sitkLinear):
+    def resamp(image: sitk.Image, new_spacing=(1.5, 1.5, 1.5), interpolator=sitk.sitkLinear):
         """
         Resample a SimpleITK image to isotropic spacing.
         
@@ -93,26 +75,30 @@ class PDF_Parser:
         sitk.Image
             Resampled image.
         """
-        # Original spacing and size
-        original_spacing = image.GetSpacing()
-        original_size = image.GetSize()
+        try:
+            # Original spacing and size
+            original_spacing = image.GetSpacing()
+            original_size = image.GetSize()
 
-        # Compute new size (preserve physical size of image)
-        new_size = [
-            int(round(osz * ospc / nspc))
-            for osz, ospc, nspc in zip(original_size, original_spacing, new_spacing)
-        ]
+            # Compute new size (preserve physical size of image)
+            new_size = [
+                int(round(osz * ospc / nspc))
+                for osz, ospc, nspc in zip(original_size, original_spacing, new_spacing)
+            ]
 
-        # Define resampler
-        resample = sitk.ResampleImageFilter()
-        resample.SetInterpolator(interpolator)
-        resample.SetOutputSpacing(new_spacing)
-        resample.SetSize(new_size)
-        resample.SetOutputDirection(image.GetDirection())
-        resample.SetOutputOrigin(image.GetOrigin())
-        resample.SetDefaultPixelValue(image.GetPixelIDValue())  # fill background if needed
+            # Define resampler
+            resample = sitk.ResampleImageFilter()
+            resample.SetInterpolator(interpolator)
+            resample.SetOutputSpacing(new_spacing)
+            resample.SetSize(new_size)
+            resample.SetOutputDirection(image.GetDirection())
+            resample.SetOutputOrigin(image.GetOrigin())
+            resample.SetDefaultPixelValue(image.GetPixelIDValue())  # fill background if needed
 
-        return resample.Execute(image)
+            return resample.Execute(image)
+        except Exception as e:
+            pdf_logger.error(f"Error during resampling: {e}")
+            raise
 
 
     def create_image(
@@ -121,7 +107,7 @@ class PDF_Parser:
 
 
         resamp_ct = PDF_Parser.resamp(ct)
-        ct_array = sitk.GetArrayFromImage(resamp_ct)
+        ct_array = sitk.GetArrayFromImage(resamp_ct).astype(np.float16)
 
         if dose_image:
             res_dose = dose_image.resample_dose_to_image_grid(ct)
@@ -129,7 +115,7 @@ class PDF_Parser:
             resampled_dose = RTDose(resampled_dose)
             resampled_dose.DoseGridScaling = dose_image.dose_grid_scaling
             resampled_dose.DoseUnits = dose_image.DoseUnits
-            dose_array = resampled_dose.get_dose_array()
+            dose_array = resampled_dose.get_dose_array().astype(np.float32)
             # res_dose = dose_image.resample_dose_to_image_grid(ct)
             # dose_array = res_dose.get_dose_array() * 100
             coronal_dose = np.sum(dose_array, axis=1)
@@ -316,18 +302,29 @@ class PDF_Parser:
         return table
 
     def parse_csv_for_plan(self, rtplans, loader):
-        
-        plans=[]
+        pdf_logger.info("Parsing RTPLAN CSV data.")
+        plans = []
         for indx, row in rtplans.iterrows():
-            rtplan = loader.read_instance(row["SOPInstanceUID"])
-            inst = loader.get_instance(row["SOPInstanceUID"])
-            results_inst, results_df = loader.advanced_query("INSTANCE", dcm_filters={"Modality":"RTRECORD", "ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID":inst.SOPInstanceUID, "TreatmentDate":"*"}, return_instances=True)
-            treatment_date_list = []
-            for records in results_inst:
-                treatment_date_list.append(int(loader.read_instance(records.SOPInstanceUID).TreatmentDate))
-            plans.append((rtplan.SOPInstanceUID, min(treatment_date_list)))
+            try:
+                rtplan = loader.read_instance(row["SOPInstanceUID"])
+                inst = loader.get_instance(row["SOPInstanceUID"])
+                results_inst, _ = loader.advanced_query(
+                    "INSTANCE",
+                    dcm_filters={
+                        "Modality": "RTRECORD",
+                        "ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID": inst.SOPInstanceUID,
+                        "TreatmentDate": "*",
+                    },
+                    return_instances=True,
+                )
+                treatment_date_list = [
+                    int(loader.read_instance(records.SOPInstanceUID).TreatmentDate)
+                    for records in results_inst
+                ]
+                plans.append((rtplan.SOPInstanceUID, min(treatment_date_list)))
+            except Exception as e:
+                pdf_logger.warning(f"Skipping invalid RTPLAN entry: {e}")
         plans.sort(key=lambda x: float(x[1]))
-
         return plans
 
     def convert_date(self, date_str):
@@ -365,20 +362,18 @@ class PDF_Parser:
         return converted_date
 
     def record_loop(self, plan, loader: DICOMLoader):
+        pdf_logger.debug(f"Collecting RTRECORD instances for plan {plan.SOPInstanceUID}.")
         self.records = []
         plan_inst = loader.get_instance(plan.SOPInstanceUID)
         ref_records = loader.get_referencing_nodes(plan_inst, "RTRECORD", "INSTANCE")
         for record_inst in ref_records:
             record = loader.read_instance(record_inst.SOPInstanceUID)
             fraction_number = str(record.TreatmentSessionBeamSequence[0].CurrentFractionNumber)
-            if str(fraction_number) == "0" or str(fraction_number) == "0.0":
-                pass
-            else:
-                self.seen_fraction_numbers.add(
-                    fraction_number
-                )  # Add the fraction number to the set
-            self.records.append([fraction_number, str(record.TreatmentDate), str(record.SOPInstanceUID)])
-        return 
+            if fraction_number not in ("0", "0.0"):
+                self.seen_fraction_numbers.add(fraction_number)
+            self.records.append(
+                [fraction_number, str(record.TreatmentDate), str(record.SOPInstanceUID)]
+            )
 
 
 
@@ -448,174 +443,182 @@ class PDF_Parser:
         return
 
     def generate_pdf(self, mrn):
-        loader = DICOMLoader(TEMP_DIRECTORY/mrn)
-        tags_to_index = ["TreatmentDate"]
-        loader.load()
-        results_inst, results_df = loader.advanced_query("INSTANCE", dcm_filters={"DoseSummationType":"BEAM"}, return_instances=True)
-        for dose_beam in results_inst:
-            file_path = dose_beam.FilePath
-            os.remove(file_path)
-        loader = DICOMLoader(TEMP_DIRECTORY/mrn)
-        loader.load()
-        rtplans = loader.query("INSTANCE", Modality="RTPLAN")
-        
-        content = []
-        styles = getSampleStyleSheet()
-        content.append(
-            Paragraph(
-                "External Beam Radiotherapy Treatment History", styles["Heading1"]
-            )
-        )
-        content.append(Spacer(1, 12))
-        doc = SimpleDocTemplate(self.pdf_filename, pagesize=letter)
-        patient_info = loader.read_instance(rtplans["SOPInstanceUID"][0])
-        # y_coordinate = 800  # Initial y-coordinate for writing text
+        pdf_logger.info(f"Starting PDF generation for MRN={mrn}")
         try:
-            normal_style = styles["Normal"]
-            normal_style.maxWidth = 500  # Adjust the value as needed
+            loader = DICOMLoader(TEMP_DIRECTORY/mrn)
+            tags_to_index = ["TreatmentDate"]
+            loader.load()
+            results_inst, results_df = loader.advanced_query("INSTANCE", dcm_filters={"DoseSummationType":"BEAM"}, return_instances=True)
+            for dose_beam in results_inst:
+                file_path = dose_beam.FilePath
+                os.remove(file_path)
+            loader = DICOMLoader(TEMP_DIRECTORY/mrn)
+            loader.load()
+            rtplans = loader.query("INSTANCE", Modality="RTPLAN")
             
-            
+            content = []
+            styles = getSampleStyleSheet()
             content.append(
                 Paragraph(
-                    f"<b>Patient Name:</b> {patient_info.PatientName}",
-                    styles["Heading2"],
+                    "External Beam Radiotherapy Treatment History", styles["Heading1"]
                 )
             )
-            content.append(
-                Paragraph(
-                    f"<b>Date of Birth:</b> {self.convert_date(patient_info.PatientBirthDate)}",
-                    styles["Heading2"],
+            content.append(Spacer(1, 12))
+            doc = SimpleDocTemplate(self.pdf_filename, pagesize=letter)
+            patient_info = loader.read_instance(rtplans["SOPInstanceUID"][0])
+            # y_coordinate = 800  # Initial y-coordinate for writing text
+            try:
+                normal_style = styles["Normal"]
+                normal_style.maxWidth = 500  # Adjust the value as needed
+                
+                
+                content.append(
+                    Paragraph(
+                        f"<b>Patient Name:</b> {patient_info.PatientName}",
+                        styles["Heading2"],
+                    )
                 )
-            )
-        except Exception as e:
-            msg = f"Could not grab info for the pdf header {str(e)}"
-            print(msg)
-        # content.append(Spacer(1, 12))
-        plans = self.parse_csv_for_plan(rtplans, loader)
-        for sop, _ in plans:
-            plan = loader.read_instance(sop)
-            inst = loader.get_instance(sop)
-            # print(f"Finding Stuff for {plan_row['SOPInstanceUID']}")
-            self.seen_fraction_numbers = set()  # Set to store seen fraction numbers
-            self.record_loop(plan, loader)
-
-            self.records.sort(key=lambda x: x[1])
-            if str(self.records[0][1])[0:4] != self.year:
-                self.study_year = str(self.records[0][1])[0:4]
-                self.year = self.study_year
-                content.append(Spacer(1, 12))
-            else:
-                self.study_year = ""
-                # Table is each section starting from page 2
-            plan_row = {}
-            target_rx_dose = []
-            plan_row["RTPlanLabel"] = plan.RTPlanLabel
-            for dose_ref in plan.DoseReferenceSequence:
-                if hasattr(dose_ref, "TargetPrescriptionDose"):
-                    target_rx_dose.append(float(dose_ref.TargetPrescriptionDose))
-                elif hasattr(dose_ref, "OrganAtRiskMaximumDose"):
-                    # Store as tuple (value, marker) so formatting later is cleaner
-                    target_rx_dose.append((float(dose_ref.OrganAtRiskMaximumDose), "*"))
-
-            plan_row["PrescriptionDose"] = target_rx_dose
-            plan_row["NumberOfFractionsPlanned"] = plan.FractionGroupSequence[0].NumberOfFractionsPlanned
-            # Make the lists for the tables
-            table_title, table_answers = self.table_append(
-                plan_row,
-            )
-            self.table_title_list.append(table_title)
-            self.table_answers_list.append(table_answers)
-
-            # Find the correct RTStruct
-            referenced_ct = loader.get_referenced_nodes(inst, "CT", "SERIES", recursive=True)
-            referenced_dose = loader.get_referencing_items(inst, "RTDOSE", "INSTANCE")
-            ct_skip = False
-            if hasattr(plan.BeamSequence[0], "TreatmentMachineName"):
-                if "ViewRay" in plan.BeamSequence[0].TreatmentMachineName:
-                    referenced_ct = []
-                    self.ct_list.append(
-                        Paragraph("Planned in ViewRay. Manually exported.")
+                content.append(
+                    Paragraph(
+                        f"<b>Date of Birth:</b> {self.convert_date(patient_info.PatientBirthDate)}",
+                        styles["Heading2"],
                     )
-                    ct_skip=True
-                if "TomoTherapy" in plan.BeamSequence[0].TreatmentMachineName:
-                    referenced_ct = []
-                    self.ct_list.append(
-                        Paragraph("Planned in TomoTherapy. Manually exported.")
-                    )
-                    ct_skip=True
-                    
-            if hasattr(plan.BeamSequence[0], "RadiationType"):
-                if "electron" in str(plan.BeamSequence[0].RadiationType).lower():
-                    if not referenced_dose:
+                )
+            except Exception as e:
+                msg = f"Could not grab info for the pdf header {str(e)}"
+                print(msg)
+            # content.append(Spacer(1, 12))
+            plans = self.parse_csv_for_plan(rtplans, loader)
+            for sop, _ in plans:
+                plan = loader.read_instance(sop)
+                inst = loader.get_instance(sop)
+                # print(f"Finding Stuff for {plan_row['SOPInstanceUID']}")
+                self.seen_fraction_numbers = set()  # Set to store seen fraction numbers
+                self.record_loop(plan, loader)
+
+                self.records.sort(key=lambda x: x[1])
+                if str(self.records[0][1])[0:4] != self.year:
+                    self.study_year = str(self.records[0][1])[0:4]
+                    self.year = self.study_year
+                    content.append(Spacer(1, 12))
+                else:
+                    self.study_year = ""
+                    # Table is each section starting from page 2
+                plan_row = {}
+                target_rx_dose = []
+                plan_row["RTPlanLabel"] = plan.RTPlanLabel
+                for dose_ref in plan.DoseReferenceSequence:
+                    if hasattr(dose_ref, "TargetPrescriptionDose"):
+                        target_rx_dose.append(float(dose_ref.TargetPrescriptionDose))
+                    elif hasattr(dose_ref, "OrganAtRiskMaximumDose"):
+                        # Store as tuple (value, marker) so formatting later is cleaner
+                        target_rx_dose.append((float(dose_ref.OrganAtRiskMaximumDose), "*"))
+
+                plan_row["PrescriptionDose"] = target_rx_dose
+                plan_row["NumberOfFractionsPlanned"] = plan.FractionGroupSequence[0].NumberOfFractionsPlanned
+                # Make the lists for the tables
+                table_title, table_answers = self.table_append(
+                    plan_row,
+                )
+                self.table_title_list.append(table_title)
+                self.table_answers_list.append(table_answers)
+
+                # Find the correct RTStruct
+                referenced_ct = loader.get_referenced_nodes(inst, "CT", "SERIES", recursive=True)
+                referenced_dose = loader.get_referencing_items(inst, "RTDOSE", "INSTANCE")
+                ct_skip = False
+                if hasattr(plan.BeamSequence[0], "TreatmentMachineName"):
+                    if "ViewRay" in plan.BeamSequence[0].TreatmentMachineName:
                         referenced_ct = []
                         self.ct_list.append(
-                        Paragraph(
-                            "Plan dose scaled for electron beam. Manually exported."
+                            Paragraph("Planned in ViewRay. Manually exported.")
                         )
-                    )
-                    ct_skip=True
-            if hasattr(plan, "Manufacturer"):
-                if "siemens" in str(plan.Manufacturer).lower():
-                    self.ct_list.append(
-                        Paragraph("Decommissioned machine. Maybe manually exportable.")
-                    )
-                    referenced_ct = []
-                    ct_skip=True
-            if hasattr(plan.BeamSequence[0], "Manufacturer"):
-                if "siemens" in str(plan.BeamSequence[0].Manufacturer).lower():
-                    self.ct_list.append(
-                        Paragraph("Decommissioned machine. Maybe manually exportable.")
-                    )
-                    referenced_ct = []
-                    ct_skip=True
-            if not ct_skip:
-                if referenced_ct:
-                    
-                    ct = loader.read_series(referenced_ct[0].SeriesInstanceUID)[0]
-                    if referenced_dose:
-                        dose = loader.read_instance(referenced_dose[0].SOPInstanceUID)
-                        
+                        ct_skip=True
+                    if "TomoTherapy" in plan.BeamSequence[0].TreatmentMachineName:
+                        referenced_ct = []
                         self.ct_list.append(
-                            self.create_image(
-                                ct,
-                                dose_image = dose,
+                            Paragraph("Planned in TomoTherapy. Manually exported.")
+                        )
+                        ct_skip=True
+                        
+                if hasattr(plan.BeamSequence[0], "RadiationType"):
+                    if "electron" in str(plan.BeamSequence[0].RadiationType).lower():
+                        if not referenced_dose:
+                            referenced_ct = []
+                            self.ct_list.append(
+                            Paragraph(
+                                "Plan dose scaled for electron beam. Manually exported."
                             )
                         )
+                        ct_skip=True
+                if hasattr(plan, "Manufacturer"):
+                    if "siemens" in str(plan.Manufacturer).lower():
+                        self.ct_list.append(
+                            Paragraph("Decommissioned machine. Maybe manually exportable.")
+                        )
+                        referenced_ct = []
+                        ct_skip=True
+                if hasattr(plan.BeamSequence[0], "Manufacturer"):
+                    if "siemens" in str(plan.BeamSequence[0].Manufacturer).lower():
+                        self.ct_list.append(
+                            Paragraph("Decommissioned machine. Maybe manually exportable.")
+                        )
+                        referenced_ct = []
+                        ct_skip=True
+                if not ct_skip:
+                    if referenced_ct:
+                        
+                        ct = loader.read_series(referenced_ct[0].SeriesInstanceUID)[0]
+                        if referenced_dose:
+                            dose = loader.read_instance(referenced_dose[0].SOPInstanceUID)
+                            
+                            self.ct_list.append(
+                                self.create_image(
+                                    ct,
+                                    dose_image = dose,
+                                )
+                            )
+                        else:
+                            self.ct_list.append(self.create_image(ct))
                     else:
-                        self.ct_list.append(self.create_image(ct))
-                else:
-                    
-                    print(
-                        f"Manually export files for \n{plan.SOPInstanceUID}"
-                    )
-                    sys.exit()
+                        
+                        print(
+                            f"Manually export files for \n{plan.SOPInstanceUID}"
+                        )
+                        pdf_logger.warning(f"Missing CT for plan {plan.SOPInstanceUID}")
+                        sys.exit()
 
-        # Create the timeline table, add it to doc
-        content.append(self.create_timeline_table())
-        if self.OAR_Flag:
-            # Add footnote explaining the asterisk
-            footnote_text = Paragraph(
-                '<font size=8>* = OrganAtRiskMaximumDose used instead of TargetPrescriptionDose</font>',
-                styles["Normal"],
-            )
-            content.append(Spacer(1, 6))
-            content.append(footnote_text)
-        # content.append(Spacer(1, 12))
-        content.append(PageBreak())
-        # y_coordinate = 750
-        # Create the summary table for each plan
-        content.append(self.create_summary_table(content))
-        
+            # Create the timeline table, add it to doc
+            content.append(self.create_timeline_table())
+            if self.OAR_Flag:
+                # Add footnote explaining the asterisk
+                footnote_text = Paragraph(
+                    '<font size=8>* = OrganAtRiskMaximumDose used instead of TargetPrescriptionDose</font>',
+                    styles["Normal"],
+                )
+                content.append(Spacer(1, 6))
+                content.append(footnote_text)
+            # content.append(Spacer(1, 12))
+            content.append(PageBreak())
+            # y_coordinate = 750
+            # Create the summary table for each plan
+            content.append(self.create_summary_table(content))
+            
 
-        # Build the PDF
-        doc.build(content)
-        # doc.build(content, onLaterPages=self.add_footer)
+            # Build the PDF
+            doc.build(content)
+            # doc.build(content, onLaterPages=self.add_footer)
 
-        # Save the PDF
-        return
+            # Save the PDF
+            pdf_logger.info(f"PDF successfully created for MRN={mrn}")
+            return
+        except Exception as e:
+            pdf_logger.error(f"Error generating PDF: {e}")
+            raise
+
 
     def zip_and_remove_directory(self, directory_path, zip_file_path):
-        # Zip the directory
+        pdf_logger.debug(f"Zipping output directory: {directory_path}")
         with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(directory_path):
                 for file in files:
@@ -623,37 +626,26 @@ class PDF_Parser:
                         os.path.join(root, file),
                         os.path.relpath(os.path.join(root, file), directory_path),
                     )
-
-        # Remove the directory
         shutil.rmtree(directory_path)
+        pdf_logger.info(f"Created zip archive: {zip_file_path}")
 
 
 def run(mrn):
     mrn = str(mrn)
+    pdf_logger.info(f"Running PDF generator for MRN={mrn}")
     pdf_parser = PDF_Parser(mrn)
     pdf_parser.generate_pdf(mrn)
-    # pdf_parser.generate_csv(mrn)
     directory_to_zip = os.path.join(TEMP_DIRECTORY, mrn)
     if not os.path.exists(OUTPUT_DIRECTORY):
         os.mkdir(OUTPUT_DIRECTORY)
-    zip_file_path = os.path.join(
-        OUTPUT_DIRECTORY, mrn + ".zip"
-    )  # Construct the zip file path
+    zip_file_path = os.path.join(OUTPUT_DIRECTORY, mrn + ".zip")
     pdf_parser.zip_and_remove_directory(directory_to_zip, zip_file_path)
 
 
 def main():
     mrn = str(input("Input MRN: "))
-    pdf_parser = PDF_Parser(mrn)
-    pdf_parser.generate_pdf()
-    # pdf_parser.generate_csv(mrn)
-    directory_to_zip = os.path.join(TEMP_DIRECTORY, mrn)
-    if not os.path.exists(OUTPUT_DIRECTORY):
-        os.mkdir(OUTPUT_DIRECTORY)
-    zip_file_path = os.path.join(
-        OUTPUT_DIRECTORY, mrn + ".zip"
-    )  # Construct the zip file path
-    pdf_parser.zip_and_remove_directory(directory_to_zip, zip_file_path)
+    pdf_logger.info(f"Manual run for MRN={mrn}")
+    run(mrn)
 
 
 if __name__ == "__main__":

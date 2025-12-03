@@ -1,3 +1,7 @@
 dist/*
 build/*
 src/__pycache__
+config.json
+dist/
+build/
+.vscode
